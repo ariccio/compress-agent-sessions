@@ -26,7 +26,7 @@ export PATH="${PATH:-}:/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin"
 # ────────────────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="compress-agent-sessions"
-readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_VERSION="0.3.1"
 readonly SCRIPT_DIR="${0:A:h}"
 readonly SCRIPT_ROOT="${SCRIPT_DIR:h}"
 
@@ -167,10 +167,10 @@ require_path_not_system() {
   canonical="${arg:A}"
   # Append trailing slash for boundary-safe prefix match.
   case "${canonical}/" in
-    /System/*|/usr/*|/bin/*|/sbin/*|/etc/*|/Library/*)
+    /System/*|/usr/*|/bin/*|/sbin/*|/etc/*|/private/etc/*|/Library/*)
       log_error "refusing to operate on system path: $arg"
       log_error "  resolved to: $canonical"
-      log_error "  matched denylist prefix (one of: /System/ /usr/ /bin/ /sbin/ /etc/ /Library/)"
+      log_error "  matched denylist prefix (one of: /System/ /usr/ /bin/ /sbin/ /etc/ /private/etc/ /Library/)"
       log_error "  this script targets per-user agentic-CLI session logs, not system files."
       log_error "  override: pass --allow-system-paths (you take ownership of the consequences)"
       return 1
@@ -323,16 +323,35 @@ count_pruned_by_reason() {
 # canonical form for set lookups.
 build_open_handle_set() {
   if ! command -v lsof >/dev/null 2>&1; then
-    log_error "lsof not installed; required for active-session (open-handle) detection."
-    log_error "Install Xcode Command Line Tools (xcode-select --install) or 'brew install lsof'."
-    log_error "Aborting to preserve safety contract — never silently ship without open-handle protection."
+    log_error "lsof not found on PATH. /usr/sbin/lsof is part of the macOS base install."
+    log_error "  Likely causes: corrupted macOS install, sandboxed/jailed environment hiding it"
+    log_error "  from PATH, or a non-stock macOS image (Asahi Linux, Docker-on-Mac)."
+    log_error "  Workaround: brew install lsof (adds to /opt/homebrew/bin or /usr/local/bin)"
+    log_error "  Aborting to preserve safety contract — never silently ship without open-handle protection."
+    return 1
+  fi
+  # Capture lsof stdout into a variable first so we can check rc + empty-output.
+  # Process substitution `< <(pipeline)` does NOT propagate the pipeline's exit code
+  # to the surrounding while-loop; the loop exits 0 even if lsof crashes.
+  # Three layered swallowers conspire to produce a silent empty OPEN_HANDLES otherwise:
+  #   1. 2>/dev/null discards lsof stderr
+  #   2. process substitution loses exit code
+  #   3. while exits 0 if pipeline produces no output
+  local _lsof_out _lsof_rc
+  _lsof_out=$(lsof -nP -w -F n 2>/dev/null); _lsof_rc=$?
+  if (( _lsof_rc != 0 )) && [[ -z "$_lsof_out" ]]; then
+    log_error "lsof returned exit=$_lsof_rc with no stdout — open-handle detection unreliable."
+    log_error "  binary: $(command -v lsof)"
+    log_error "  Likely causes: TCC sandbox, kernel/userland mismatch (Asahi, Docker-on-Mac),"
+    log_error "  lsof shim that writes only to stderr, or broken build."
+    log_error "  Refusing to operate without trustworthy open-handle data."
     return 1
   fi
   OPEN_HANDLES=()
   local path
   while IFS= read -r path; do
     [[ -n "$path" ]] && OPEN_HANDLES[$path]=1
-  done < <(lsof -nP -w -F n 2>/dev/null | /usr/bin/awk '/^n\//{print substr($0,2)}' | /usr/bin/sort -u)
+  done < <(printf '%s\n' "$_lsof_out" | /usr/bin/awk '/^n\//{print substr($0,2)}' | /usr/bin/sort -u)
 }
 
 # Batched stat for size + mtime + flags + name. Replaces 3 separate stat
@@ -765,8 +784,8 @@ _run_tool_capturing_stderr() {
   local _varname="$1"; shift
   local _tmpfile
   printf -v "$_varname" '%s' ""
-  if ! _tmpfile=$(mktemp "/tmp/.cas-stderr.XXXXXX"); then
-    log_error "_run_tool_capturing_stderr: mktemp failed (is /tmp full or unwritable?)"
+  if ! _tmpfile=$(mktemp -t cas-stderr); then
+    log_error "_run_tool_capturing_stderr: mktemp failed (is \$TMPDIR/tmp full or unwritable?)"
     return $_CAS_RC_MKTEMP_FAILED
   fi
   printf -v "$_varname" '%s' "$_tmpfile"
@@ -809,6 +828,9 @@ _compress_with_afsctool() {
 _compress_with_ditto() {
   local file="$1" dst _stmp _rc
   dst="$(dirname -- "$file")/.$(basename -- "$file").cas-tmp"
+  # Trap INT/TERM so a mid-flight SIGINT between ditto and mv doesn't orphan $dst.
+  # The outer cmd_compress trap is restored after this function returns.
+  trap 'rm -f "$dst"; trap - INT TERM' INT TERM
   _run_tool_capturing_stderr _stmp ditto --hfsCompression -- "$file" "$dst"
   _rc=$?
   if (( _rc != 0 )); then
@@ -818,14 +840,17 @@ _compress_with_ditto() {
       log_warn "_compress_with_ditto failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
     fi
     rm -f "$_stmp" "$dst"
+    trap - INT TERM
     return $_rc
   fi
   rm -f "$_stmp"
   if ! mv -f -- "$dst" "$file"; then
     rm -f "$dst"
     log_warn "_compress_with_ditto: mv rename failed for $file (ditto step succeeded; original file is intact; dst=$dst)"
+    trap - INT TERM
     return 1
   fi
+  trap - INT TERM
 }
 
 compress_file() {
@@ -1033,8 +1058,15 @@ _restore_with_afsctool() {
 _restore_via_rewrite() {
   local file="$1" tmp
   tmp="$(dirname -- "$file")/.$(basename -- "$file").cas-rtmp"
-  cat -- "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f -- "$tmp" "$file"
+  # Trap INT/TERM so a mid-flight interrupt between cat and mv doesn't orphan $tmp.
+  trap 'rm -f "$tmp"; trap - INT TERM' INT TERM
+  cat -- "$file" > "$tmp" || { rm -f "$tmp"; trap - INT TERM; return 1; }
+  if ! mv -f -- "$tmp" "$file"; then
+    rm -f "$tmp"
+    trap - INT TERM
+    return 1
+  fi
+  trap - INT TERM
 }
 
 restore_file() {
@@ -1071,16 +1103,17 @@ cmd_restore() {
   # This pre-pass scans before any mutation OR dry-run log line, so the
   # gate is enforced for both real and dry-run paths (Codex finding #6).
   if (( ! CONFIRM_DESTRUCTIVE )); then
+    # Use `find -flags +compressed` (BSD find supports -flags predicate) to push
+    # the decmpfs filter into find itself — no per-file stat fork needed.
+    # This is O(constant) overhead versus the previous O(N-stat-forks) loop.
     local _gate_root _gate_file _gate_count=0
     for _gate_root in "${roots[@]}"; do
       [[ -d "$_gate_root" ]] || continue
       while IFS= read -rd '' _gate_file; do
         [[ -n "$_gate_file" ]] || continue
-        if _has_decmpfs_flag_live "$_gate_file"; then
-          _gate_count=$((_gate_count + 1))
-          (( _gate_count > 100 )) && break
-        fi
-      done < <(find "$_gate_root" -type f -print0)
+        _gate_count=$((_gate_count + 1))
+        (( _gate_count > 100 )) && break
+      done < <(find "$_gate_root" -type f -flags +compressed -print0)
       (( _gate_count > 100 )) && break
     done
     if (( _gate_count > 100 )); then
@@ -1175,7 +1208,7 @@ main() {
     case "$1" in
       -h|--help)              usage; return 0 ;;
       -V|--version)           version; return 0 ;;
-      --age-days)             shift; [[ $# -gt 0 ]] || { log_error "--age-days needs a value"; return 64; }; AGE_DAYS="$1"; shift ;;
+      --age-days)             shift; [[ $# -gt 0 ]] || { log_error "--age-days needs a value"; return 64; }; AGE_DAYS="$1"; (( AGE_DAYS >= 1 )) || { log_error "--age-days must be >= 1 (got: $AGE_DAYS); zero would produce malformed find -mtime +-1"; return 64; }; shift ;;
       --tool)                 shift; [[ $# -gt 0 ]] || { log_error "--tool needs a value"; return 64; }; TOOL="$1"; shift ;;
       --algorithm)            shift; [[ $# -gt 0 ]] || { log_error "--algorithm needs a value"; return 64; }; ALGORITHM="$1"; shift ;;
       --level)                shift; [[ $# -gt 0 ]] || { log_error "--level needs a value"; return 64; }; LEVEL="$1"; shift ;;

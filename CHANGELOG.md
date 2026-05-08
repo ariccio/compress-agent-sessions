@@ -5,6 +5,24 @@ All notable changes to `compress-agent-sessions` will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-08
+
+Cloud-review (Claude/Copilot/Codex on PR #760) addressed before OSS gains traction.
+
+### Fixed
+- `build_open_handle_set` no longer silently masks lsof runtime failures. Process substitution `< <(pipeline)` does not propagate the pipeline's exit code, and `2>/dev/null` swallows stderr. If lsof returned non-zero with empty stdout (TCC sandbox, kernel/userland mismatch on Asahi/Docker-on-Mac, broken `lsof` shim), `OPEN_HANDLES` was silently empty — every file appeared not-held-open and active-session protection was lost. Helper now captures stdout into a variable, checks rc + empty-output combo, and fails fast with a structured diagnostic naming the binary path and exit code. (Claude review #2 HIGH)
+- System-path denylist now includes `/private/etc/*` since `/etc` on macOS is a symlink to `/private/etc` and the canonicalizer (`${arg:A}`) resolves through symlinks. Without this, a path argument like `/etc/foo` was correctly refused but `/private/etc/foo` (the same location after canonicalization) was not. (Codex review)
+- `cmd_restore` `--confirm-destructive` gate now uses `find -type f -flags +compressed -print0` to push the decmpfs filter into BSD `find` itself, eliminating a per-file `stat` fork loop. Constant-overhead instead of O(N-stat-forks). (Claude review #3 MEDIUM)
+- `lsof not installed` diagnostic now correctly states that lsof ships at `/usr/sbin/lsof` as part of macOS base install (NOT Xcode CLT, which was the prior incorrect remediation). Mentions Asahi/Docker-on-Mac and `brew install lsof` as a workaround. (Claude review #4 MEDIUM)
+- `_run_tool_capturing_stderr` now uses `mktemp -t cas-stderr` (respects `$TMPDIR` per-user `/var/folders/.../T/`) instead of hardcoded `/tmp/.cas-stderr.XXXXXX`. Avoids leaking sensitive session paths into world-readable `/tmp`, and handles hardened environments where `$TMPDIR` is writable but `/tmp` is not. (Claude review #5 MEDIUM)
+- `--age-days` parser now validates `>= 1` and rejects `0` with a structured error explaining the malformed `find -mtime +-1` expression that would otherwise result. (Claude review #6 LOW)
+- `_compress_with_ditto` and `_restore_via_rewrite` now install per-function `trap 'rm -f "$dst"; trap - INT TERM' INT TERM` so a SIGINT/SIGTERM between the ditto/cat step and the `mv` cannot leave an orphan `.cas-tmp` / `.cas-rtmp` file in the user's session directory. (Claude review #8 LOW)
+
+### Deferred (intentional)
+- `_loud_chflags_warning` non-suppressibility for daemon contexts (Claude review #7 LOW): design tradeoff — deserves its own decision, not a quiet change in a fix-up release.
+- `cmd_restore` skipping age/grace/current-month filters that `cmd_compress` enforces (Claude review #9 LOW): possibly intentional "undo everything" semantics; documenting intent in a future v0.4.0 instead of changing behavior.
+- Test coverage gaps for tool-dispatcher failure paths and `_run_tool_capturing_stderr` failure surfacing (Claude review #10): partial — adding ONE test in this iteration would over-scope the fix-up release.
+
 ## [0.3.0] — 2026-05-07
 
 Defensive pass before public OSS release. Hardens first-run UX across non-Darwin hosts, malformed environments, and dangerous-path arguments without expanding scope.

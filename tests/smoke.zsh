@@ -183,7 +183,7 @@ echo Linux
 FAKE_UNAME
 chmod +x "$fake_bin/uname"
 
-non_darwin_out=$(PATH="$fake_bin:$PATH" "$BIN" estimate --age-days 14 --ledger-dir "$LEDGER_ROOT" "$FAKE_CODEX" 2>&1) && non_darwin_status=0 || non_darwin_status=$?
+set +e; non_darwin_out=$(PATH="$fake_bin:$PATH" "$BIN" estimate --age-days 14 --ledger-dir "$LEDGER_ROOT" "$FAKE_CODEX" 2>&1); non_darwin_status=$?; set -e
 if (( non_darwin_status != 0 )) && echo "$non_darwin_out" | grep -qi 'requires macOS\|Darwin'; then
   pass "non-Darwin host rejected with diagnostic (kernel: Linux)"
 else
@@ -206,7 +206,7 @@ rm -rf -- "$fake_bin"
 # PATH manipulation alone is defeated by line 7 of the script which appends
 # /usr/bin to PATH unconditionally. Use the new COMPRESSION_TOOL_BIN env
 # indirection.
-missing_ct_out=$(COMPRESSION_TOOL_BIN=/var/empty/no-such-compression-tool "$BIN" estimate --age-days 14 --ledger-dir "$LEDGER_ROOT" "$FAKE_CODEX" 2>&1) && missing_ct_status=0 || missing_ct_status=$?
+set +e; missing_ct_out=$(COMPRESSION_TOOL_BIN=/var/empty/no-such-compression-tool "$BIN" estimate --age-days 14 --ledger-dir "$LEDGER_ROOT" "$FAKE_CODEX" 2>&1); missing_ct_status=$?; set -e
 if (( missing_ct_status != 0 )) && echo "$missing_ct_out" | grep -q 'compression_tool not executable'; then
   pass "missing compression_tool refused with diagnostic"
 else
@@ -216,7 +216,7 @@ fi
 
 # ---- test 11: system-path denylist (positive AND negative) ----------------
 # Positive: passing /Library as a target path must refuse.
-sys_path_out=$("$BIN" list --age-days 14 --ledger-dir "$LEDGER_ROOT" /Library 2>&1) && sys_path_status=0 || sys_path_status=$?
+set +e; sys_path_out=$("$BIN" list --age-days 14 --ledger-dir "$LEDGER_ROOT" /Library 2>&1); sys_path_status=$?; set -e
 if (( sys_path_status != 0 )) && echo "$sys_path_out" | grep -q 'refusing to operate on system path'; then
   pass "system-path denylist refused /Library"
 else
@@ -228,7 +228,7 @@ fi
 user_lib="$FIXTURE_ROOT/Users-test/Library/cas-test-data"
 mkdir -p "$user_lib"
 touch -t "$old_ts" -- "$user_lib/.placeholder.jsonl"
-user_lib_out=$("$BIN" list --age-days 14 --ledger-dir "$LEDGER_ROOT" "$user_lib" 2>&1) && user_lib_status=0 || user_lib_status=$?
+set +e; user_lib_out=$("$BIN" list --age-days 14 --ledger-dir "$LEDGER_ROOT" "$user_lib" 2>&1); user_lib_status=$?; set -e
 if (( user_lib_status == 0 )) && ! echo "$user_lib_out" | grep -q 'refusing to operate on system path'; then
   pass "system-path denylist accepted user path containing 'Library'"
 else
@@ -237,7 +237,7 @@ else
 fi
 
 # Override: --allow-system-paths must permit /Library.
-override_out=$("$BIN" list --age-days 99999 --allow-system-paths --ledger-dir "$LEDGER_ROOT" /Library 2>&1) && override_status=0 || override_status=$?
+set +e; override_out=$("$BIN" list --age-days 99999 --allow-system-paths --ledger-dir "$LEDGER_ROOT" /Library 2>&1); override_status=$?; set -e
 if (( override_status == 0 )); then
   pass "--allow-system-paths bypasses denylist"
 else
@@ -273,7 +273,7 @@ if (( flagged_count < 101 )); then
 fi
 
 # Gate must REFUSE without --confirm-destructive.
-gate_refuse_out=$("$BIN" restore --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1) && gate_refuse_status=0 || gate_refuse_status=$?
+set +e; gate_refuse_out=$("$BIN" restore --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1); gate_refuse_status=$?; set -e
 if (( gate_refuse_status != 0 )) && echo "$gate_refuse_out" | grep -q '>100 decmpfs-compressed files'; then
   pass "restore gated without --confirm-destructive (>100 flagged files)"
 else
@@ -282,7 +282,7 @@ else
 fi
 
 # Gate must ALSO refuse for --dry-run.
-dry_refuse_out=$("$BIN" restore --dry-run --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1) && dry_refuse_status=0 || dry_refuse_status=$?
+set +e; dry_refuse_out=$("$BIN" restore --dry-run --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1); dry_refuse_status=$?; set -e
 if (( dry_refuse_status != 0 )) && echo "$dry_refuse_out" | grep -q '>100 decmpfs-compressed files'; then
   pass "restore --dry-run respects gate (no mutation, still gated)"
 else
@@ -291,7 +291,7 @@ else
 fi
 
 # Gate must PASS with --confirm-destructive.
-gate_pass_out=$("$BIN" restore --confirm-destructive --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1) && gate_pass_status=0 || gate_pass_status=$?
+set +e; gate_pass_out=$("$BIN" restore --confirm-destructive --ledger-dir "$LEDGER_ROOT" "$flag_fixture" 2>&1); gate_pass_status=$?; set -e
 if (( gate_pass_status == 0 )); then
   pass "restore proceeds with --confirm-destructive"
 else
@@ -305,7 +305,7 @@ for cmd in estimate list stats; do
     stats) extra_args=() ;;
     *)     extra_args=("$FAKE_CODEX") ;;
   esac
-  rd_out=$("$BIN" "$cmd" --age-days 14 --ledger-dir "$LEDGER_ROOT" "${extra_args[@]}" 2>&1) && rd_status=0 || rd_status=$?
+  set +e; rd_out=$("$BIN" "$cmd" --age-days 14 --ledger-dir "$LEDGER_ROOT" "${extra_args[@]}" 2>&1); rd_status=$?; set -e
   if (( rd_status == 0 )); then
     pass "non-destructive subcommand smoke: $cmd"
   else
