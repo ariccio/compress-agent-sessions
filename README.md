@@ -144,12 +144,19 @@ younger than `--age-days` (default 14), zero candidates is correct. Check:
     compress-agent-sessions list                  # see classification
     compress-agent-sessions list --age-days 0     # ignore age (debug)
 
-### `lsof not installed`
+### `lsof not found on PATH`
 
-Required for active-handle safety detection. Install via:
+Required for active-handle safety detection. `/usr/sbin/lsof` ships with
+macOS as part of the base install — it is **not** a Xcode CLT component.
+If the script cannot find it, the likely causes are:
 
-    xcode-select --install                        # ships lsof
-    # or
+- **Asahi Linux / Docker-on-Mac**: the macOS base userspace is absent; lsof
+  is genuinely missing and must be installed.
+- **Stripped macOS environment**: a minimal container or CI image that
+  deliberately excludes base tools.
+
+Workaround:
+
     brew install lsof
 
 The script aborts hard rather than silently shipping without open-handle

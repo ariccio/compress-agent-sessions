@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 set -euo pipefail
-setopt extended_glob
+setopt extended_glob local_traps
 zmodload zsh/datetime  # provides $EPOCHSECONDS and strftime builtin (no fork)
 
 # Ensure standard Unix utilities are findable even if the caller's PATH is minimal.
@@ -26,7 +26,7 @@ export PATH="${PATH:-}:/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin"
 # ────────────────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="compress-agent-sessions"
-readonly SCRIPT_VERSION="0.3.1"
+readonly SCRIPT_VERSION="0.3.2"
 readonly SCRIPT_DIR="${0:A:h}"
 readonly SCRIPT_ROOT="${SCRIPT_DIR:h}"
 
@@ -829,8 +829,9 @@ _compress_with_ditto() {
   local file="$1" dst _stmp _rc
   dst="$(dirname -- "$file")/.$(basename -- "$file").cas-tmp"
   # Trap INT/TERM so a mid-flight SIGINT between ditto and mv doesn't orphan $dst.
-  # The outer cmd_compress trap is restored after this function returns.
-  trap 'rm -f "$dst"; trap - INT TERM' INT TERM
+  # local_traps (set globally at top) ensures this function-scoped trap auto-restores
+  # the outer cmd_compress _sigint_handler on function exit.
+  trap 'rm -f "$dst" "$_stmp"; trap - INT TERM' INT TERM
   _run_tool_capturing_stderr _stmp ditto --hfsCompression -- "$file" "$dst"
   _rc=$?
   if (( _rc != 0 )); then

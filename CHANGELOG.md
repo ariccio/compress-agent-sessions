@@ -5,6 +5,16 @@ All notable changes to `compress-agent-sessions` will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-08
+
+Four fixes from Claude re-review of v0.3.1.
+
+### Fixed
+- **HIGH (Claude)** — `setopt local_traps` added alongside `extended_glob` at script top. Without it, zsh traps are global: the `trap 'rm -f "$dst"; ...' INT TERM` installed inside `_compress_with_ditto` (and the analogous trap in `_restore_via_rewrite`) reset the signal disposition to default-kill on exit, silently clobbering `cmd_compress`'s outer `_sigint_handler`. With `local_traps`, function-scoped trap installs auto-restore the prior trap on function return, so `cmd_compress`'s `_cas_interrupted=1` path works correctly even after `_compress_with_ditto` runs.
+- **MEDIUM (Claude)** — README Troubleshooting section `### lsof not found on PATH` (was `### lsof not installed`) corrected. Previously listed `xcode-select --install` as the fix, which is wrong: `/usr/sbin/lsof` ships with macOS base install, not with Xcode CLT. Section now names Asahi Linux and Docker-on-Mac as realistic causes and retains `brew install lsof` as the workaround.
+- **LOW (Claude)** — `_compress_with_ditto` interrupt trap now also removes `$_stmp` (the stderr capture tmpfile) on SIGINT/SIGTERM, preventing a leaked tmpfile when the signal fires after mktemp but before the success-path `rm -f "$_stmp"`.
+- **LOW (Copilot)** — CHANGELOG `## [0.3.0]` Iter-2 entry for `_run_tool_capturing_stderr` mktemp failure annotated with `(later changed to sentinel exit code 251 in Iter-3)` to resolve the internal contradiction with the Iter-3 entry describing the same behavior at the final shipped value.
+
 ## [0.3.1] — 2026-05-08
 
 Cloud-review (Claude/Copilot/Codex on PR #760) addressed before OSS gains traction.
@@ -46,7 +56,7 @@ Defensive pass before public OSS release. Hardens first-run UX across non-Darwin
 
 #### Iter-2 hardening (post-review)
 - `_compress_with_ditto` now uses `_run_tool_capturing_stderr` instead of `>/dev/null 2>&1`, making it the fifth (and final) dispatcher to capture tool stderr on failure. Previously ditto failures were fully silent.
-- `_run_tool_capturing_stderr`: `mktemp` failure now emits `log_error` naming `/tmp` exhaustion as the likely cause before returning 1. Previously a disk-full `/tmp` caused every subsequent compress/restore to show `compress/restore failed: <file>` with no root-cause hint.
+- `_run_tool_capturing_stderr`: `mktemp` failure now emits `log_error` naming `/tmp` exhaustion as the likely cause before returning 1 _(later changed to sentinel exit code 251 in Iter-3)_. Previously a disk-full `/tmp` caused every subsequent compress/restore to show `compress/restore failed: <file>` with no root-cause hint.
 - `_run_tool_capturing_stderr`: named variable is now pre-initialized to empty string before `mktemp`, ensuring callers always have a defined (if empty) `_stmp` even on mktemp failure — eliminates the latent `rm -f ""` portability hole.
 - All five dispatchers: when a tool exits non-zero but writes nothing to stderr (e.g. SIGKILL/exit 137, SIGSEGV/exit 139), a synthetic `(no stderr captured; exit=N — possible signal kill)` message is now emitted so signal-killed tools are not silently swallowed.
 - `_run_tool_capturing_stderr` comment: fixed two inaccuracies — removed the wrong "via REPLY" claim (the mechanism is a named variable, not `REPLY`); corrected the usage line from `_run_capture_stderr` to `_run_tool_capturing_stderr`; clarified that stderr is captured to a tmpfile that the caller (not the helper) is responsible for removing.
