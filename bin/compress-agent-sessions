@@ -26,7 +26,7 @@ export PATH="${PATH:-}:/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin"
 # ────────────────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_NAME="compress-agent-sessions"
-readonly SCRIPT_VERSION="0.3.2"
+readonly SCRIPT_VERSION="0.3.3"
 readonly SCRIPT_DIR="${0:A:h}"
 readonly SCRIPT_ROOT="${SCRIPT_DIR:h}"
 
@@ -1060,9 +1060,12 @@ _restore_via_rewrite() {
   local file="$1" tmp
   tmp="$(dirname -- "$file")/.$(basename -- "$file").cas-rtmp"
   # Trap INT/TERM so a mid-flight interrupt between cat and mv doesn't orphan $tmp.
+  # local_traps (set globally at top) ensures this function-scoped trap auto-restores
+  # any outer handler installed by the caller on function exit.
   trap 'rm -f "$tmp"; trap - INT TERM' INT TERM
   cat -- "$file" > "$tmp" || { rm -f "$tmp"; trap - INT TERM; return 1; }
   if ! mv -f -- "$tmp" "$file"; then
+    log_warn "_restore_via_rewrite: mv rename failed for $file (cat-rewrite to \$tmp succeeded; original compressed file is INTACT at $file; orphaned uncompressed tmp at $tmp)"
     rm -f "$tmp"
     trap - INT TERM
     return 1

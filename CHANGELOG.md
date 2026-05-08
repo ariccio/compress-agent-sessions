@@ -5,12 +5,22 @@ All notable changes to `compress-agent-sessions` will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-05-08
+
+Four LOW polish fixes from Claude review #3 on v0.3.2 (verdict: LGTM with minor follow-ups).
+
+### Fixed
+- **LOW (Claude review #3 finding 2a)** — `_restore_via_rewrite` trap comment now mirrors `_compress_with_ditto`: added one line noting that `local_traps` auto-restores any outer handler installed by the caller on function exit.
+- **LOW (Claude review #3 finding 2c)** — `_restore_via_rewrite` mv rename failure now emits a structured `log_warn` (mirrors the Iter-3 pattern from `_compress_with_ditto`): names the function, distinguishes rename failure from cat-rewrite failure, confirms the original compressed file is INTACT, and notes the orphaned uncompressed tmp path.
+- **LOW (Claude review #3 finding 2b)** — CHANGELOG `## [0.3.2]` HIGH entry softened: the prior wording implied `_restore_via_rewrite`'s trap would clobber `cmd_compress`'s outer `_sigint_handler`, but `_restore_via_rewrite` is called from `cmd_restore`, which installs no such handler. Reworded to "would clobber any outer handler installed by the caller".
+- **LOW (Claude review #3 finding 2d)** — README: "a Xcode" → "an Xcode" (vowel onset).
+
 ## [0.3.2] — 2026-05-08
 
 Four fixes from Claude re-review of v0.3.1.
 
 ### Fixed
-- **HIGH (Claude)** — `setopt local_traps` added alongside `extended_glob` at script top. Without it, zsh traps are global: the `trap 'rm -f "$dst"; ...' INT TERM` installed inside `_compress_with_ditto` (and the analogous trap in `_restore_via_rewrite`) reset the signal disposition to default-kill on exit, silently clobbering `cmd_compress`'s outer `_sigint_handler`. With `local_traps`, function-scoped trap installs auto-restore the prior trap on function return, so `cmd_compress`'s `_cas_interrupted=1` path works correctly even after `_compress_with_ditto` runs.
+- **HIGH (Claude)** — `setopt local_traps` added alongside `extended_glob` at script top. Without it, zsh traps are global: the `trap 'rm -f "$dst"; ...' INT TERM` installed inside `_compress_with_ditto` (and the analogous trap in `_restore_via_rewrite`) would clobber any outer handler installed by the caller. With `local_traps`, function-scoped trap installs auto-restore the prior trap on function return, so `cmd_compress`'s `_cas_interrupted=1` path works correctly even after `_compress_with_ditto` runs.
 - **MEDIUM (Claude)** — README Troubleshooting section `### lsof not found on PATH` (was `### lsof not installed`) corrected. Previously listed `xcode-select --install` as the fix, which is wrong: `/usr/sbin/lsof` ships with macOS base install, not with Xcode CLT. Section now names Asahi Linux and Docker-on-Mac as realistic causes and retains `brew install lsof` as the workaround.
 - **LOW (Claude)** — `_compress_with_ditto` interrupt trap now also removes `$_stmp` (the stderr capture tmpfile) on SIGINT/SIGTERM, preventing a leaked tmpfile when the signal fires after mktemp but before the success-path `rm -f "$_stmp"`.
 - **LOW (Copilot)** — CHANGELOG `## [0.3.0]` Iter-2 entry for `_run_tool_capturing_stderr` mktemp failure annotated with `(later changed to sentinel exit code 251 in Iter-3)` to resolve the internal contradiction with the Iter-3 entry describing the same behavior at the final shipped value.

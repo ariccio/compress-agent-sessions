@@ -147,7 +147,7 @@ younger than `--age-days` (default 14), zero candidates is correct. Check:
 ### `lsof not found on PATH`
 
 Required for active-handle safety detection. `/usr/sbin/lsof` ships with
-macOS as part of the base install — it is **not** a Xcode CLT component.
+macOS as part of the base install — it is **not** an Xcode CLT component.
 If the script cannot find it, the likely causes are:
 
 - **Asahi Linux / Docker-on-Mac**: the macOS base userspace is absent; lsof
