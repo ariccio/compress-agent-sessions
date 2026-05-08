@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a bug in compress-agent-sessions
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report. The fields below are required because
+        nearly every meaningful bug needs them. Reports missing required fields
+        will be closed and reopened once they're added.
+
+        Before filing, please skim the README's
+        [Troubleshooting](https://github.com/ariccio/compress-agent-sessions#troubleshooting)
+        section — common issues are documented there.
+
+  - type: dropdown
+    id: macos-version
+    attributes:
+      label: macOS version
+      description: Output of `sw_vers -productVersion`. Pick the closest match.
+      options:
+        - "26.x (Tahoe)"
+        - "15.x (Sequoia)"
+        - "14.x (Sonoma)"
+        - "13.x (Ventura) or earlier"
+        - "Other (specify in 'What happened' below)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Compression backend
+      description: Which compression tool was used (`--tool` value, or what auto-detection picked).
+      options:
+        - applesauce
+        - afsctool
+        - ditto
+        - other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: estimate-output
+    attributes:
+      label: Verbose estimate output
+      description: |
+        Run `compress-agent-sessions estimate --verbose 2>&1` against the same
+        scope where the bug occurred and paste the full output here. Redact
+        any sensitive paths.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: which-output
+    attributes:
+      label: Backend availability
+      description: Output of `which applesauce afsctool ditto`
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-vs-expected
+    attributes:
+      label: What happened vs. what you expected
+      description: |
+        Be concrete. "It didn't work" is not actionable. Include the exact
+        command you ran, the output, and what you expected instead.
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope-check
+    attributes:
+      label: Scope acknowledgment
+      description: This project's scope is frozen. Please confirm.
+      options:
+        - label: I understand new subcommands, backends, and platforms are out of scope. This is a bug report on existing behavior, not a feature request.
+          required: true

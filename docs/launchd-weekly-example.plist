@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly-run launchd template for compress-agent-sessions.
+
+  To install:
+    1. Edit ProgramArguments path below to match your install location.
+    2. mkdir -p ~/Library/LaunchAgents
+    3. cp docs/launchd-weekly-example.plist \
+         ~/Library/LaunchAgents/com.user.compress-agent-sessions.plist
+    4. launchctl load ~/Library/LaunchAgents/com.user.compress-agent-sessions.plist
+
+  To uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.user.compress-agent-sessions.plist
+    rm ~/Library/LaunchAgents/com.user.compress-agent-sessions.plist
+
+  Runs every Sunday at 03:00 local time. Logs stdout/stderr to
+  ~/Library/Logs/compress-agent-sessions.log.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.compress-agent-sessions</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- EDIT this path to match your install -->
+    <string>/usr/local/bin/compress-agent-sessions</string>
+    <string>compress</string>
+    <string>--age-days</string>
+    <string>14</string>
+    <string>--quiet</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/Library/Logs/compress-agent-sessions.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/Library/Logs/compress-agent-sessions.log</string>
+
+  <!-- Run at low priority so we don't fight interactive work. -->
+  <key>Nice</key>
+  <integer>10</integer>
+
+  <!-- Only wake the machine if it's already awake. -->
+  <key>StartOnMount</key>
+  <false/>
+</dict>
+</plist>

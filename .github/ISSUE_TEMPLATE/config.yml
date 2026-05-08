@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Feature requests
+    url: https://github.com/ariccio/compress-agent-sessions#scope
+    about: Scope is frozen — see README "Scope" section. New subcommands, backends, or platforms will not be merged. Fork instead.
+  - name: Security vulnerabilities
+    url: https://github.com/ariccio/compress-agent-sessions/security/advisories/new
+    about: Use GitHub private vulnerability reporting, not public Issues.
+  - name: Troubleshooting (read first)
+    url: https://github.com/ariccio/compress-agent-sessions#troubleshooting
+    about: Common issues (no candidates found, lsof not installed, ditto silent no-op, chflags truncation) are documented in the README.

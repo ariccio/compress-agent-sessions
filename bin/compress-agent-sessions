@@ -1,0 +1,1224 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+setopt extended_glob
+zmodload zsh/datetime  # provides $EPOCHSECONDS and strftime builtin (no fork)
+
+# Ensure standard Unix utilities are findable even if the caller's PATH is minimal.
+export PATH="${PATH:-}:/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin"
+
+# ────────────────────────────────────────────────────────────────────────────
+# CRITICAL SAFETY INVARIANT — DO NOT REMOVE OR WEAKEN
+# ────────────────────────────────────────────────────────────────────────────
+# macOS APFS decmpfs (transparent compression) is INCOMPATIBLE with chflags(1)
+# and chflags(2). Calling chflags with ANY flag list on a file whose
+# `stat -f '%Sf'` output contains the substring "compressed" will TRUNCATE
+# THE FILE TO ZERO BYTES IMMEDIATELY. Verified empirically on macOS 26.4.
+# This is documented Apple kernel behavior, not a vulnerability in this tool.
+# This destruction is silent — chflags returns 0 — and the content is
+# unrecoverable from the live filesystem.
+#
+# This script must NEVER call chflags on a compressed file. The classifier
+# is read-only against decmpfs files. The compress/restore dispatchers below
+# delegate to applesauce/afsctool/ditto/cat-rewrite, none of which mutate flags.
+# Any future contributor adding chflags logic to this script: stop, decompress
+# first via `applesauce decompress` or equivalent, THEN mutate flags, THEN
+# re-compress if desired. See `_loud_chflags_warning` for the runtime banner.
+# ────────────────────────────────────────────────────────────────────────────
+
+readonly SCRIPT_NAME="compress-agent-sessions"
+readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_DIR="${0:A:h}"
+readonly SCRIPT_ROOT="${SCRIPT_DIR:h}"
+
+log_info()  { [[ "${QUIET:-0}" == "1" ]] || printf '[%s] %s\n' "$SCRIPT_NAME" "$*" ; }
+log_warn()  { printf '[%s] warning: %s\n' "$SCRIPT_NAME" "$*" >&2 ; }
+log_error() { printf '[%s] error: %s\n' "$SCRIPT_NAME" "$*" >&2 ; }
+log_debug() { [[ "${VERBOSE:-0}" == "1" ]] && printf '[%s] debug: %s\n' "$SCRIPT_NAME" "$*" >&2 ; return 0 ; }
+
+# Loud unsuppressible stderr banner about the chflags+decmpfs data-loss risk.
+# Emitted at start of every compress/restore invocation, even with --quiet.
+_loud_chflags_warning() {
+  local bar='═══════════════════════════════════════════════════════════════════════════════'
+  printf '\n%s\n' "$bar" >&2
+  printf '  CRITICAL macOS SAFETY NOTE — DO NOT chflags(1) DECMPFS FILES\n' >&2
+  printf '%s\n' "$bar" >&2
+  printf '  This script touches macOS APFS transparent-compression (decmpfs) files.\n' >&2
+  printf '  Calling chflags(1) or chflags(2) on a file whose `stat -f "%%Sf"` includes\n' >&2
+  printf '  the string "compressed" will TRUNCATE the file to ZERO BYTES SILENTLY.\n' >&2
+  printf '  This is documented Apple kernel behavior, not a vulnerability in this tool.\n' >&2
+  printf '  This script never calls chflags on a compressed file. If you wrap it,\n' >&2
+  printf '  modify it, or pipe its output into other tools that might call chflags,\n' >&2
+  printf '  decompress first (applesauce decompress / afsctool -d). Restore is also\n' >&2
+  printf '  available via: %s restore <path>\n' "$SCRIPT_NAME" >&2
+  printf '%s\n\n' "$bar" >&2
+}
+
+usage() {
+  cat <<USAGE
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Apply macOS transparent per-file compression (APFS/HFS+ decmpfs) to
+stale agentic-CLI session-log JSONL archives. Targets Claude Code,
+Codex CLI, and Gemini CLI by default; accepts explicit paths too.
+
+Usage:
+  $SCRIPT_NAME [SUBCOMMAND] [OPTIONS] [PATHS...]
+
+Subcommands (default: estimate):
+  estimate   Predict savings without touching files
+  compress   Apply compression to eligible files
+  list       Show eligible files and per-file skip reasons
+  stats      Print historical/cumulative savings from the ledger
+  restore    Decompress files previously compressed by this tool
+
+Options:
+  --age-days N              Only files older than N days (default: 14)
+  --tool TOOL               applesauce|afsctool|ditto|auto (default: auto)
+  --algorithm ALGO          LZFSE|LZVN|ZLIB (default: LZFSE)
+  --level N                 1..9 (default: 9)
+  --include SCOPE           claude|codex|gemini|all (default: all; repeatable)
+  --exclude GLOB            Skip files matching glob (repeatable)
+  --active-grace-minutes N  Skip files modified in last N minutes (default: 15)
+  --sample-fraction F       estimate: fraction to benchmark (default: 0.05)
+  --ledger-dir PATH         Override ledger location
+  --dry-run                 compress/restore: describe without modifying (restore --dry-run also requires --confirm-destructive when >100 files)
+  --confirm-destructive     restore: required when scope holds >100 compressed files (applies to --dry-run too)
+  --allow-system-paths      override system-path denylist (you take ownership)
+  --quiet | --verbose
+  -h, --help                Show this help
+  -V, --version             Show version
+
+Environment overrides:
+  COMPRESSION_TOOL_BIN      Path to macOS compression_tool (default: /usr/bin/compression_tool)
+  XDG_STATE_HOME            Base for ledger directory (default: \$HOME/.local/state)
+
+Paths (override auto-discovery):
+  $SCRIPT_NAME compress ~/.codex/sessions/2026/01
+
+See README.md for the full manual.
+USAGE
+}
+
+version() { printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" ; }
+
+# --- platform / decmpfs availability gate ------------------------------------
+# Hard-fails on non-Darwin OR Darwin-shaped hosts where decmpfs is not actually
+# usable (Asahi Linux, Docker-on-Mac, hypothetical APFS-stripped builds).
+# Detection strategy (uname is necessary but NOT sufficient):
+#   1. uname -s must be "Darwin"
+#   2. compression_tool must exist at the configured path
+#   3. tmpfile probe via compression_tool succeeds (kernel/library wired up)
+# We do NOT probe applesauce/afsctool here — those are tool-specific failures,
+# reported separately by detect_tool. compression_tool ships with macOS by
+# default and is the most reliable decmpfs availability signal.
+require_decmpfs_capable_host() {
+  local kernel="$(uname -s 2>/dev/null || echo unknown)"
+  if [[ "$kernel" != "Darwin" ]]; then
+    log_error "$SCRIPT_NAME requires macOS (Darwin); detected kernel: $kernel"
+    log_error "  decmpfs (transparent APFS/HFS+ compression) is a macOS-only feature."
+    log_error "  Linux/Asahi/Docker-on-Mac hosts have no kernel support for UF_COMPRESSED."
+    log_error "  No port is planned. See README 'Limitations' section."
+    return 1
+  fi
+  if [[ ! -x "$COMPRESSION_TOOL_BIN" ]]; then
+    log_error "compression_tool not executable at: $COMPRESSION_TOOL_BIN"
+    log_error "  Expected at /usr/bin/compression_tool on every supported macOS install."
+    log_error "  This usually indicates one of:"
+    log_error "    - kernel reports Darwin but decmpfs userspace is absent (Asahi/Docker-on-Mac)"
+    log_error "    - macOS install is incomplete or compression_tool was deleted"
+    log_error "    - COMPRESSION_TOOL_BIN env override points to a missing binary"
+    log_error "  Override path: COMPRESSION_TOOL_BIN=/path/to/compression_tool $SCRIPT_NAME ..."
+    return 1
+  fi
+  # Last-mile probe: actually try compressing a tmpfile. Catches kernels
+  # that lie about Darwin-ness but have no working decmpfs.
+  local probe_dir probe_in probe_out
+  probe_dir=$(mktemp -d -t cas-probe) || { log_error "mktemp failed during decmpfs probe"; return 1; }
+  probe_in="$probe_dir/probe.in"
+  probe_out="$probe_dir/probe.out"
+  printf 'compression-availability-probe\n' > "$probe_in"
+  if ! "$COMPRESSION_TOOL_BIN" -encode -a lzfse -i "$probe_in" -o "$probe_out" >/dev/null 2>&1; then
+    rm -rf -- "$probe_dir"
+    log_error "compression_tool probe failed at: $COMPRESSION_TOOL_BIN"
+    log_error "  Binary present but failed to encode a tmpfile via LZFSE."
+    log_error "  Likely causes: Darwin-shaped kernel without decmpfs support (Asahi, Docker-on-Mac),"
+    log_error "  corrupt /usr/bin/compression_tool, or sandbox restrictions on tmp I/O."
+    log_error "  Probe path: $probe_in -> $probe_out"
+    return 1
+  fi
+  rm -rf -- "$probe_dir"
+  return 0
+}
+
+# --- system-path denylist ----------------------------------------------------
+# Refuse to operate on canonicalized paths that resolve to system locations
+# where compression could destabilize macOS or other users. Override with
+# --allow-system-paths.
+#
+# Match contract: canonical-prefix-with-trailing-slash. Substring matching
+# would falsely refuse legitimate user paths like /Users/alex/Library/...
+# (which contains the string "/Library/" but is NOT system).
+# DO NOT ADD: /Volumes (legitimate user external storage) or /private
+# (canonical resolution of /tmp, breaks user mktemp paths).
+require_path_not_system() {
+  local arg="$1" canonical
+  # Use zsh's :A modifier — same realpath-equivalent we already use for
+  # candidate canonicalization in build_candidate_canonical_cache.
+  canonical="${arg:A}"
+  # Append trailing slash for boundary-safe prefix match.
+  case "${canonical}/" in
+    /System/*|/usr/*|/bin/*|/sbin/*|/etc/*|/Library/*)
+      log_error "refusing to operate on system path: $arg"
+      log_error "  resolved to: $canonical"
+      log_error "  matched denylist prefix (one of: /System/ /usr/ /bin/ /sbin/ /etc/ /Library/)"
+      log_error "  this script targets per-user agentic-CLI session logs, not system files."
+      log_error "  override: pass --allow-system-paths (you take ownership of the consequences)"
+      return 1
+      ;;
+  esac
+  # Bare root: canonical is exactly "/" so canonical/ is "//"
+  if [[ "$canonical" == "/" ]]; then
+    log_error "refusing to operate on filesystem root: $arg"
+    log_error "  override: pass --allow-system-paths"
+    return 1
+  fi
+  return 0
+}
+
+require_no_system_paths_in_targets() {
+  (( ALLOW_SYSTEM_PATHS )) && return 0
+  (( ${#TARGET_PATHS[@]} == 0 )) && return 0
+  local p
+  for p in "${TARGET_PATHS[@]}"; do
+    require_path_not_system "$p" || return 1
+  done
+  return 0
+}
+
+AGE_DAYS=14
+TOOL="auto"
+ALGORITHM="LZFSE"
+LEVEL=9
+ACTIVE_GRACE_MINUTES=15
+SAMPLE_FRACTION="0.05"
+# LEDGER_DIR initialized in main() AFTER platform check;
+# expanding ${HOME:-...} at script-load under set -u crashes a non-Darwin
+# host with no $HOME before our diagnostic can fire (Codex finding #1).
+LEDGER_DIR=""
+DRY_RUN=0
+QUIET=0
+VERBOSE=0
+CONFIRM_DESTRUCTIVE=0
+ALLOW_SYSTEM_PATHS=0
+COMPRESSION_TOOL_BIN="${COMPRESSION_TOOL_BIN:-/usr/bin/compression_tool}"
+typeset -ga INCLUDES EXCLUDES TARGET_PATHS
+INCLUDES=()
+EXCLUDES=()
+TARGET_PATHS=()
+
+# Caches populated per-command-invocation by build_*_cache helpers.
+typeset -gA OPEN_HANDLES        # canonical path -> 1 (set membership)
+typeset -gA FILE_SIZE           # path -> size in bytes
+typeset -gA FILE_MTIME          # path -> mtime epoch
+typeset -gA FILE_FLAGS          # path -> stat -f '%Sf' string
+typeset -gA CANDIDATE_CANONICAL # path -> realpath-canonicalized form
+typeset -gA PRUNED_REASON_COUNTS # reason -> count (filled by discover/prune passes)
+
+# --- filesystem discovery ------------------------------------------------------
+
+get_scope_dirs() {
+  local want_all=0 want_claude=0 want_codex=0 want_gemini=0 s
+  if (( ${#INCLUDES[@]} == 0 )); then
+    want_all=1
+  else
+    for s in "${INCLUDES[@]}"; do
+      case "$s" in
+        all)    want_all=1 ;;
+        claude) want_claude=1 ;;
+        codex)  want_codex=1 ;;
+        gemini) want_gemini=1 ;;
+        *)      log_warn "unknown --include scope: $s (ignored)" ;;
+      esac
+    done
+  fi
+  if (( want_all || want_claude )); then
+    [[ -d "$HOME/.claude/projects" ]] && printf '%s\n' "$HOME/.claude/projects"
+  fi
+  if (( want_all || want_codex )); then
+    [[ -d "$HOME/.codex/sessions" ]] && printf '%s\n' "$HOME/.codex/sessions"
+  fi
+  if (( want_all || want_gemini )); then
+    [[ -d "$HOME/.gemini/sessions" ]] && printf '%s\n' "$HOME/.gemini/sessions"
+  fi
+}
+
+# Compose the find predicate set used by candidate discovery. Pushes
+# age, recent-mtime, and current-codex-month filters into find itself
+# so they're evaluated by libc/kernel rather than per-file shell.
+#
+# Notes on the predicates (verified against macOS BSD find man page):
+#   -mtime +N  ≡ modified MORE THAN N×24h-rounded periods ago. To preserve
+#               the "older than 14 days" semantics of the original epoch
+#               arithmetic, use +(AGE_DAYS-1) so a file exactly AGE_DAYS
+#               old qualifies.
+#   ! -mmin -N ≡ NOT modified within last N×60s (rounded up to whole minute).
+#   -prune over an excluded subtree avoids descending into thousands of
+#               irrelevant files (better than `! -path "$prefix/*"`).
+discover_candidate_files_print0() {
+  local age_threshold=$((AGE_DAYS - 1))
+  local current_codex_prefix="$HOME/.codex/sessions/$(strftime '%Y/%m' $EPOCHSECONDS)"
+  local root
+  for root in "$@"; do
+    [[ -d "$root" ]] || continue
+    # Single find per root with all kernel-level predicates applied.
+    if [[ "$root" == "$HOME/.codex/sessions" ]]; then
+      find "$root" \
+        -path "$current_codex_prefix" -prune -o \
+        -type f -mtime +"$age_threshold" ! -mmin -"$ACTIVE_GRACE_MINUTES" \
+        -print0
+    else
+      find "$root" \
+        -type f -mtime +"$age_threshold" ! -mmin -"$ACTIVE_GRACE_MINUTES" \
+        -print0
+    fi
+  done
+}
+
+# Count files pruned by the find-level predicates (reverse-set discovery).
+# Used by cmd_list and the summary line so operators retain visibility into
+# what was filtered out before classification.
+count_pruned_by_reason() {
+  local age_threshold=$((AGE_DAYS - 1))
+  local current_codex_prefix="$HOME/.codex/sessions/$(strftime '%Y/%m' $EPOCHSECONDS)"
+  local root n
+  local total_too_young=0 total_recent_mtime=0 total_current_month=0
+  for root in "$@"; do
+    [[ -d "$root" ]] || continue
+    n=$(find "$root" -type f -mtime -"$age_threshold" 2>/dev/null | wc -l)
+    total_too_young=$((total_too_young + n))
+    n=$(find "$root" -type f -mmin -"$ACTIVE_GRACE_MINUTES" -mtime +"$age_threshold" 2>/dev/null | wc -l)
+    total_recent_mtime=$((total_recent_mtime + n))
+    if [[ "$root" == "$HOME/.codex/sessions" && -d "$current_codex_prefix" ]]; then
+      n=$(find "$current_codex_prefix" -type f 2>/dev/null | wc -l)
+      total_current_month=$((total_current_month + n))
+    fi
+  done
+  PRUNED_REASON_COUNTS[too-young]=$total_too_young
+  PRUNED_REASON_COUNTS[recent-mtime]=$total_recent_mtime
+  PRUNED_REASON_COUNTS[current-month]=$total_current_month
+}
+
+# Bulk-fetch all currently-held-open files via ONE system-wide lsof call.
+# Replaces the per-file `lsof -t -- file` that took 2h 46min on 43k files.
+# Approach: `lsof -nP -w -F n` enumerates the kernel FD table, awk filters
+# to absolute-path lines (lsof emits many non-path 'n' lines like
+# `n[ctl com.apple...]` that must be filtered with `^n/`).
+#
+# macOS lsof reports symlink-resolved canonical paths already (e.g.,
+# `/tmp/x` → `/private/tmp/x`). We do NOT re-realpath them here — adding a
+# `xargs realpath` stage would silently DROP paths the user can't traverse
+# (other users' restricted dirs, broken links) from the held-open set,
+# weakening the safety contract. Candidate paths get canonicalized via
+# `${file:A}` in build_candidate_canonical_cache, which matches lsof's
+# canonical form for set lookups.
+build_open_handle_set() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    log_error "lsof not installed; required for active-session (open-handle) detection."
+    log_error "Install Xcode Command Line Tools (xcode-select --install) or 'brew install lsof'."
+    log_error "Aborting to preserve safety contract — never silently ship without open-handle protection."
+    return 1
+  fi
+  OPEN_HANDLES=()
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && OPEN_HANDLES[$path]=1
+  done < <(lsof -nP -w -F n 2>/dev/null | /usr/bin/awk '/^n\//{print substr($0,2)}' | /usr/bin/sort -u)
+}
+
+# Batched stat for size + mtime + flags + name. Replaces 3 separate stat
+# calls per file (was ~130k stat invocations). One xargs-batched stat call
+# handles thousands of files per fork (ARG_MAX cap ≈ 1MB on macOS).
+# Takes paths as args (NOT stdin) so the function can be called normally
+# rather than on the right side of a pipe — pipe-RHS would put the function
+# in a subshell and discard the array assignments below.
+build_metadata_cache() {
+  FILE_SIZE=()
+  FILE_MTIME=()
+  FILE_FLAGS=()
+  (( $# == 0 )) && return 0
+  local size mtime flags name
+  while IFS='|' read -r size mtime flags name; do
+    [[ -z "$name" ]] && continue
+    FILE_SIZE[$name]=$size
+    FILE_MTIME[$name]=$mtime
+    FILE_FLAGS[$name]=$flags
+  done < <(printf '%s\0' "$@" | xargs -0 stat -f '%z|%m|%Sf|%N' -- 2>/dev/null)
+}
+
+# Per-file canonicalization via zsh's `${file:A}` history modifier.
+# Approach C user-locked design: canonicalize candidate paths so files
+# held open via symlinked paths are correctly detected.
+#
+# Why NOT batched xargs realpath: the original v0.2.0 implementation used
+# `xargs -0 realpath` which silently drops paths it can't resolve (file
+# vanished between find and realpath, EACCES, broken symlink). The
+# resulting canonicals[] array would be SHORTER than "$@" and the
+# positional pairing `canonicals[$i] ↔ paths[$i]` would misalign for every
+# file after a drop, mapping file_N to canonical_of_file_(N+1) and
+# silently weakening the open-handle safety check.
+#
+# `${file:A}` is pair-safe by construction (one expansion per loop body),
+# uses libc realpath internally with no fork per call, and falls back to
+# the original path if resolution fails. Cost: ~22s for 43k files in
+# pure-zsh — acceptable for the safety guarantee.
+build_candidate_canonical_cache() {
+  CANDIDATE_CANONICAL=()
+  (( $# == 0 )) && return 0
+  local file
+  for file in "$@"; do
+    CANDIDATE_CANONICAL[$file]="${file:A}"
+  done
+}
+
+# --- per-file classification --------------------------------------------------
+# After discovery+prefetch, classify_file is reduced to TWO checks:
+#   1. Is this file held open by any process? (O(1) hash lookup)
+#   2. Does it already carry the decmpfs flag? (O(1) hash lookup)
+# All other skip reasons (too-young, recent-mtime, current-month) are
+# eliminated at the find level. excluded-glob is checked here since it
+# uses zsh-extended globs that don't fully translate to find -path.
+
+matches_any_exclude() {
+  local file="$1" pat
+  for pat in "${EXCLUDES[@]}"; do
+    [[ "$file" == ${~pat} ]] && return 0
+  done
+  return 1
+}
+
+classify_file() {
+  local file="$1"
+  if matches_any_exclude "$file"; then
+    echo "skip:excluded-glob"; return
+  fi
+  local canon="${CANDIDATE_CANONICAL[$file]:-$file}"
+  if (( ${+OPEN_HANDLES[$canon]} )); then
+    echo "skip:open-handle"; return
+  fi
+  local flags="${FILE_FLAGS[$file]:-}"
+  if [[ "$flags" == *compressed* ]]; then
+    echo "skip:already-compressed"; return
+  fi
+  echo "candidate"
+}
+
+# --- formatting ---------------------------------------------------------------
+
+format_bytes() {
+  local bytes="$1"
+  if (( bytes >= 1073741824 )); then
+    printf '%.1fG' "$(( bytes / 1073741824.0 ))"
+  elif (( bytes >= 1048576 )); then
+    printf '%.1fM' "$(( bytes / 1048576.0 ))"
+  elif (( bytes >= 1024 )); then
+    printf '%.1fK' "$(( bytes / 1024.0 ))"
+  else
+    printf '%dB' "$bytes"
+  fi
+}
+
+format_mtime_ago() {
+  local mtime="$1" delta
+  delta=$(( EPOCHSECONDS - mtime ))
+  if (( delta < 60 )); then
+    printf '%ds ago' "$delta"
+  elif (( delta < 3600 )); then
+    printf '%dm ago' "$(( delta / 60 ))"
+  elif (( delta < 86400 )); then
+    printf '%dh ago' "$(( delta / 3600 ))"
+  else
+    printf '%dd ago' "$(( delta / 86400 ))"
+  fi
+}
+
+# --- shared scope resolver (used by list/estimate/compress/restore) ----------
+
+resolve_roots() {
+  local -a roots
+  if (( ${#TARGET_PATHS[@]} > 0 )); then
+    roots=("${TARGET_PATHS[@]}")
+  else
+    roots=( ${(f)"$(get_scope_dirs)"} )
+  fi
+  if (( ${#roots[@]} == 0 )); then
+    log_error "no scope directories found (checked ~/.claude/projects, ~/.codex/sessions, ~/.gemini/sessions)"
+    return 1
+  fi
+  printf '%s\n' "${roots[@]}"
+}
+
+# Load all caches needed for fast classification. Called once per cmd_*
+# invocation. Returns 1 if a hard precondition (lsof) is missing.
+prefetch_for_classification() {
+  local -a roots
+  roots=( "$@" )
+  (( ${#roots[@]} == 0 )) && return 1
+
+  build_open_handle_set || return 1
+
+  # Discover candidates via find with predicates pushed in.
+  local -a candidate_paths
+  while IFS= read -rd '' file; do
+    candidate_paths+=("$file")
+  done < <(discover_candidate_files_print0 "${roots[@]}")
+
+  # Bulk metadata fetch + candidate canonicalization.
+  if (( ${#candidate_paths[@]} > 0 )); then
+    build_metadata_cache "${candidate_paths[@]}"
+    build_candidate_canonical_cache "${candidate_paths[@]}"
+  fi
+
+  # Pruned-reason counts for the operator-visible summary.
+  count_pruned_by_reason "${roots[@]}"
+
+  # Stash the candidate list for callers via a global.
+  CANDIDATE_PATHS=( "${candidate_paths[@]}" )
+}
+typeset -ga CANDIDATE_PATHS
+CANDIDATE_PATHS=()
+
+# --- ledger I/O --------------------------------------------------------------
+
+ledger_ensure_dir() {
+  /bin/mkdir -p -- "$LEDGER_DIR/runs"
+}
+
+ledger_write_run() {
+  local ts="$1" tool="$2" fc="$3" bb="$4" ba="$5" ws="$6" intr="$7" fs="$8" ff="$9"
+  local saved=$((bb - ba))
+  ledger_ensure_dir
+  local run_path="$LEDGER_DIR/runs/${ts}.json"
+  local tmp="$run_path.tmp"
+  print -r -- "{
+  \"run_id\": \"$ts\",
+  \"script_version\": \"$SCRIPT_VERSION\",
+  \"tool\": \"$tool\",
+  \"algorithm\": \"$ALGORITHM\",
+  \"level\": $LEVEL,
+  \"age_threshold_days\": $AGE_DAYS,
+  \"files_compressed\": $fc,
+  \"files_skipped\": $fs,
+  \"files_failed\": $ff,
+  \"bytes_before\": $bb,
+  \"bytes_after\": $ba,
+  \"bytes_saved\": $saved,
+  \"wall_time_seconds\": $ws,
+  \"interrupted\": $intr
+}" > "$tmp"
+  /bin/mv -f -- "$tmp" "$run_path"
+  echo "$run_path"
+}
+
+ledger_update_cumulative() {
+  local run_id="$1" fc="$2" saved="$3"
+  ledger_ensure_dir
+  local path="$LEDGER_DIR/cumulative.txt"
+  local first_run="$run_id" last_run="$run_id"
+  local total_runs=0 total_files=0 total_saved=0
+
+  if [[ -f "$path" ]]; then
+    local key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        first_run)              [[ -n "$val" ]] && first_run="$val" ;;
+        total_runs)             total_runs="$val" ;;
+        total_files_compressed) total_files="$val" ;;
+        total_bytes_saved)      total_saved="$val" ;;
+      esac
+    done < "$path"
+  fi
+
+  total_runs=$((total_runs + 1))
+  total_files=$((total_files + fc))
+  total_saved=$((total_saved + saved))
+  last_run="$run_id"
+
+  local tmp="$path.tmp"
+  print -r -- "first_run=$first_run
+last_run=$last_run
+total_runs=$total_runs
+total_files_compressed=$total_files
+total_bytes_saved=$total_saved" > "$tmp"
+  /bin/mv -f -- "$tmp" "$path"
+}
+
+# --- subcommand: list --------------------------------------------------------
+
+cmd_list() {
+  local -a roots
+  roots=( ${(f)"$(resolve_roots)"} ) || return 1
+
+  log_info "scanning: ${(j:, :)roots}"
+
+  prefetch_for_classification "${roots[@]}" || return 1
+
+  typeset -A skip_counts
+  local candidate_count=0 candidate_bytes=0 total_count=${#CANDIDATE_PATHS[@]}
+  local file size mtime state reason
+
+  printf '%-70s  %-22s  %8s  %s\n' "PATH" "STATE" "SIZE" "MTIME"
+  printf -- '-%.0s' {1..120}
+  printf '\n'
+
+  for file in "${CANDIDATE_PATHS[@]}"; do
+    [[ -n "$file" ]] || continue
+    size="${FILE_SIZE[$file]:-0}"
+    mtime="${FILE_MTIME[$file]:-0}"
+    state=$(classify_file "$file")
+    printf '%-70s  %-22s  %8s  %s\n' "$file" "$state" "$(format_bytes $size)" "$(format_mtime_ago $mtime)"
+    if [[ "$state" == "candidate" ]]; then
+      candidate_count=$((candidate_count + 1))
+      candidate_bytes=$((candidate_bytes + size))
+    else
+      reason="${state#skip:}"
+      skip_counts[$reason]=$(( ${skip_counts[$reason]:-0} + 1 ))
+    fi
+  done
+
+  printf '\n'
+  log_info "summary: $candidate_count candidates ($(format_bytes $candidate_bytes)), $((total_count - candidate_count)) skipped of $total_count surviving find-level filters"
+  local count
+  for reason in ${(ok)skip_counts}; do
+    count="${skip_counts[$reason]}"
+    log_info "  skip:$reason = $count"
+  done
+
+  # Operator visibility into find-level pruning.
+  local pruned_total=0 r
+  for r in too-young recent-mtime current-month; do
+    pruned_total=$((pruned_total + ${PRUNED_REASON_COUNTS[$r]:-0}))
+  done
+  if (( pruned_total > 0 )); then
+    log_info "  pruned-by-find: $pruned_total files (too-young=${PRUNED_REASON_COUNTS[too-young]:-0}, recent-mtime=${PRUNED_REASON_COUNTS[recent-mtime]:-0}, current-month=${PRUNED_REASON_COUNTS[current-month]:-0})"
+  fi
+}
+
+# --- subcommand: estimate ----------------------------------------------------
+
+cmd_estimate() {
+  local -a roots
+  roots=( ${(f)"$(resolve_roots)"} ) || return 1
+
+  log_info "scanning: ${(j:, :)roots}"
+
+  prefetch_for_classification "${roots[@]}" || return 1
+
+  local -a candidates
+  local file state size
+  local total_count=0 total_bytes=0
+
+  for file in "${CANDIDATE_PATHS[@]}"; do
+    [[ -n "$file" ]] || continue
+    state=$(classify_file "$file")
+    if [[ "$state" == "candidate" ]]; then
+      candidates+=("$file")
+      size="${FILE_SIZE[$file]:-0}"
+      total_bytes=$((total_bytes + size))
+      total_count=$((total_count + 1))
+    fi
+  done
+
+  if (( total_count == 0 )); then
+    log_info "no candidates found (age >= ${AGE_DAYS}d, not recently modified, not open, not already compressed)"
+    return 0
+  fi
+
+  local sample_count
+  sample_count=$(awk -v t="$total_count" -v f="$SAMPLE_FRACTION" 'BEGIN {
+    n = int(t * f); if (n < 10) n = 10; if (n > t) n = t; print n
+  }')
+
+  log_info "candidates: $total_count files ($(format_bytes $total_bytes))"
+  log_info "sampling: $sample_count files for ratio benchmark via $ALGORITHM (compression_tool)"
+
+  local -a shuffled
+  shuffled=( "${(@f)$(printf '%s\n' "${candidates[@]}" | awk 'BEGIN{srand()} {print rand() "\t" $0}' | sort -k1,1n | cut -f2-)}" )
+  local -a sample_files
+  sample_files=( "${(@)shuffled[1,$sample_count]}" )
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d -t cas-estimate) || { log_error "mktemp failed"; return 1; }
+  local algo_lc="${(L)ALGORITHM}"
+  local sample_src_bytes=0 sample_cmp_bytes=0 sample_ok=0
+  local src_size cmp_size out i=0
+
+  for file in "${sample_files[@]}"; do
+    i=$((i + 1))
+    src_size="${FILE_SIZE[$file]:-0}"
+    (( src_size == 0 )) && continue
+    out="$tmp_dir/s$i"
+    log_debug "compressing sample $i: $file -> $out (algo=$algo_lc)"
+    if ! "$COMPRESSION_TOOL_BIN" -encode -a "$algo_lc" -i "$file" -o "$out"; then
+      log_debug "compression_tool failed on $file"
+      continue
+    fi
+    cmp_size=$(stat -f '%z' -- "$out" 2>/dev/null) || { rm -f "$out"; continue; }
+    sample_src_bytes=$((sample_src_bytes + src_size))
+    sample_cmp_bytes=$((sample_cmp_bytes + cmp_size))
+    sample_ok=$((sample_ok + 1))
+    rm -f "$out"
+  done
+  rm -rf "$tmp_dir"
+
+  if (( sample_ok == 0 )); then
+    log_error "estimate: all $sample_count samples failed via $COMPRESSION_TOOL_BIN"
+    log_error "  algorithm: $algo_lc  candidates scanned: $total_count"
+    log_error "  override the binary path with: COMPRESSION_TOOL_BIN=/path/to/compression_tool"
+    log_error "  if the binary exists but probes fail, decmpfs may be unavailable on this host."
+    return 1
+  fi
+
+  local mean_ratio expected_cmp expected_saved saved_pct
+  mean_ratio=$(awk -v s="$sample_src_bytes" -v c="$sample_cmp_bytes" 'BEGIN { if (c > 0) printf "%.2f", s/c; else print "1.00" }')
+  expected_cmp=$(awk -v t="$total_bytes" -v r="$mean_ratio" 'BEGIN { print int(t/r) }')
+  expected_saved=$((total_bytes - expected_cmp))
+  saved_pct=$(awk -v s="$expected_saved" -v t="$total_bytes" 'BEGIN { if (t > 0) printf "%.1f", 100.0*s/t; else print "0.0" }')
+
+  printf '\n'
+  printf '=== Compression estimate (algorithm: %s) ===\n' "$ALGORITHM"
+  printf '  candidates:       %d files, %s total\n' "$total_count" "$(format_bytes $total_bytes)"
+  printf '  sampled:          %d files compressed into a tempdir and deleted\n' "$sample_ok"
+  printf '  mean ratio:       %sx\n' "$mean_ratio"
+  printf '  expected size:    %s\n' "$(format_bytes $expected_cmp)"
+  printf '  expected savings: %s (%s%%)\n' "$(format_bytes $expected_saved)" "$saved_pct"
+  local pruned_total=0 r
+  for r in too-young recent-mtime current-month; do
+    pruned_total=$((pruned_total + ${PRUNED_REASON_COUNTS[$r]:-0}))
+  done
+  if (( pruned_total > 0 )); then
+    printf '  pruned-by-find:   %d files (too-young=%d, recent-mtime=%d, current-month=%d)\n' \
+      "$pruned_total" \
+      "${PRUNED_REASON_COUNTS[too-young]:-0}" \
+      "${PRUNED_REASON_COUNTS[recent-mtime]:-0}" \
+      "${PRUNED_REASON_COUNTS[current-month]:-0}"
+  fi
+  printf '\n'
+  printf 'Note: sampled ratio is approximate; applesauce / afsctool output\n'
+  printf 'will be directionally similar but slightly different in absolute bytes.\n'
+  printf '\n'
+}
+
+# --- tool detection / dispatchers --------------------------------------------
+
+detect_tool() {
+  local requested="${TOOL:-auto}"
+  case "$requested" in
+    applesauce|afsctool|ditto)
+      command -v "$requested" >/dev/null 2>&1 || { log_error "requested --tool $requested is not installed"; return 1; }
+      echo "$requested"
+      ;;
+    auto)
+      if command -v applesauce >/dev/null 2>&1; then echo applesauce
+      elif command -v afsctool  >/dev/null 2>&1; then echo afsctool
+      elif command -v ditto     >/dev/null 2>&1; then echo ditto
+      else
+        log_error "no compression tool available; install applesauce (brew install Dr-Emann/homebrew-tap/applesauce) or afsctool (brew install afsctool)"
+        return 1
+      fi
+      ;;
+    *)
+      log_error "unknown --tool value: $requested (applesauce|afsctool|ditto|auto)"
+      return 1
+      ;;
+  esac
+}
+
+physical_bytes() {
+  local blocks
+  blocks=$(stat -f '%b' -- "$1" 2>/dev/null) || { echo 0; return; }
+  echo $((blocks * 512))
+}
+
+apparent_bytes() {
+  stat -f '%z' -- "$1" 2>/dev/null || echo 0
+}
+
+# ─── compress / restore dispatchers ────────────────────────────────────────
+# SAFETY: NONE of these dispatchers may call chflags(1) on the input file.
+# decmpfs files truncate to 0 bytes if chflags is invoked (see header banner).
+# applesauce/afsctool handle decmpfs xattrs internally without flag mutation.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Shared helper: run a tool command with stderr captured to a tmpfile.
+# Stores the tmpfile path in the named variable <tmpfile_var_name> on success.
+# Usage:  _run_tool_capturing_stderr <tmpfile_var_name> <cmd...>
+# On success: tool stdout goes to /dev/null, stderr captured but caller discards
+#   it (rm -f "$_stmp"); returns 0.
+# On failure: returns tool's exit code; captured stderr accessible via tmpfile
+#   path stored in the named variable, so caller can surface it via log_warn.
+# On mktemp failure: emits log_error, leaves named variable empty, and returns
+#   251 (sentinel). Callers check for 251 to suppress the misleading
+#   "possible signal kill" message — the root cause was already named by the
+#   log_error above.
+_CAS_RC_MKTEMP_FAILED=251
+_run_tool_capturing_stderr() {
+  local _varname="$1"; shift
+  local _tmpfile
+  printf -v "$_varname" '%s' ""
+  if ! _tmpfile=$(mktemp "/tmp/.cas-stderr.XXXXXX"); then
+    log_error "_run_tool_capturing_stderr: mktemp failed (is /tmp full or unwritable?)"
+    return $_CAS_RC_MKTEMP_FAILED
+  fi
+  printf -v "$_varname" '%s' "$_tmpfile"
+  "$@" >/dev/null 2>"$_tmpfile"
+}
+
+_compress_with_applesauce() {
+  local file="$1" algo_lc="${(L)ALGORITHM}" _stmp _rc
+  _run_tool_capturing_stderr _stmp applesauce compress -c "$algo_lc" -l "$LEVEL" --quiet "$file"
+  _rc=$?
+  if (( _rc != 0 )); then
+    if [[ -s "$_stmp" ]]; then
+      log_warn "_compress_with_applesauce failed (exit $_rc): $(< "$_stmp")"
+    elif (( _rc != _CAS_RC_MKTEMP_FAILED )); then
+      log_warn "_compress_with_applesauce failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
+    fi
+    rm -f "$_stmp"
+    return $_rc
+  fi
+  rm -f "$_stmp"
+}
+
+_compress_with_afsctool() {
+  local file="$1" ncpu _stmp _rc
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+  _run_tool_capturing_stderr _stmp afsctool -c -T "$ALGORITHM" "-$LEVEL" -j "$ncpu" -- "$file"
+  _rc=$?
+  if (( _rc != 0 )); then
+    if [[ -s "$_stmp" ]]; then
+      log_warn "_compress_with_afsctool failed (exit $_rc): $(< "$_stmp")"
+    elif (( _rc != _CAS_RC_MKTEMP_FAILED )); then
+      log_warn "_compress_with_afsctool failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
+    fi
+    rm -f "$_stmp"
+    return $_rc
+  fi
+  rm -f "$_stmp"
+}
+
+_compress_with_ditto() {
+  local file="$1" dst _stmp _rc
+  dst="$(dirname -- "$file")/.$(basename -- "$file").cas-tmp"
+  _run_tool_capturing_stderr _stmp ditto --hfsCompression -- "$file" "$dst"
+  _rc=$?
+  if (( _rc != 0 )); then
+    if [[ -s "$_stmp" ]]; then
+      log_warn "_compress_with_ditto failed (exit $_rc): $(< "$_stmp")"
+    elif (( _rc != _CAS_RC_MKTEMP_FAILED )); then
+      log_warn "_compress_with_ditto failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
+    fi
+    rm -f "$_stmp" "$dst"
+    return $_rc
+  fi
+  rm -f "$_stmp"
+  if ! mv -f -- "$dst" "$file"; then
+    rm -f "$dst"
+    log_warn "_compress_with_ditto: mv rename failed for $file (ditto step succeeded; original file is intact; dst=$dst)"
+    return 1
+  fi
+}
+
+compress_file() {
+  local file="$1" tool="$2"
+  case "$tool" in
+    applesauce) _compress_with_applesauce "$file" ;;
+    afsctool)   _compress_with_afsctool "$file" ;;
+    ditto)      _compress_with_ditto "$file" ;;
+    *)          log_error "unknown tool: $tool"; return 1 ;;
+  esac
+}
+
+_cas_interrupted=0
+_sigint_handler() {
+  _cas_interrupted=1
+  log_warn "interrupted; flushing and exiting"
+}
+
+# --- subcommand: compress ----------------------------------------------------
+
+cmd_compress() {
+  _loud_chflags_warning
+  local tool
+  tool=$(detect_tool) || return 1
+
+  local -a roots
+  roots=( ${(f)"$(resolve_roots)"} ) || return 1
+  log_info "scanning: ${(j:, :)roots}"
+  log_info "tool: $tool  algorithm: $ALGORITHM  level: $LEVEL  dry-run: $( (( DRY_RUN )) && echo yes || echo no )"
+
+  prefetch_for_classification "${roots[@]}" || return 1
+
+  local run_start_epoch run_start_ts
+  run_start_epoch=$EPOCHSECONDS
+  run_start_ts=$(strftime '%Y-%m-%dT%H:%M:%SZ' $EPOCHSECONDS)
+
+  trap '_sigint_handler' INT TERM
+
+  local file state before_bytes after_apparent after_physical reason
+  local compressed_count=0 skipped_count=0 grew_count=0 failed_count=0
+  local total_before=0 total_after=0
+  typeset -A skip_counts
+
+  for file in "${CANDIDATE_PATHS[@]}"; do
+    [[ -n "$file" ]] || continue
+    (( _cas_interrupted )) && break
+
+    state=$(classify_file "$file")
+    if [[ "$state" != "candidate" ]]; then
+      reason="${state#skip:}"
+      skip_counts[$reason]=$(( ${skip_counts[$reason]:-0} + 1 ))
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
+    before_bytes="${FILE_SIZE[$file]:-0}"
+
+    if (( DRY_RUN )); then
+      log_info "would compress: $file ($(format_bytes $before_bytes))"
+      compressed_count=$((compressed_count + 1))
+      total_before=$((total_before + before_bytes))
+      continue
+    fi
+
+    if ! compress_file "$file" "$tool"; then
+      log_warn "compress failed: $file"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+
+    after_apparent=$(apparent_bytes "$file")
+    after_physical=$(physical_bytes "$file")
+
+    local min_savings_bytes=$((before_bytes / 50))
+    if (( before_bytes > 0 && (before_bytes - after_physical) < min_savings_bytes )); then
+      log_debug "negligible savings: $file (before=$before_bytes physical=$after_physical)"
+      grew_count=$((grew_count + 1))
+    fi
+
+    total_before=$((total_before + before_bytes))
+    total_after=$((total_after + after_physical))
+    compressed_count=$((compressed_count + 1))
+    log_debug "compressed: $file ($(format_bytes $before_bytes) -> $(format_bytes $after_physical))"
+  done
+
+  trap - INT TERM
+
+  printf '\n'
+  log_info "summary:"
+  if (( DRY_RUN )); then
+    log_info "  would compress: $compressed_count files, $(format_bytes $total_before) total (nothing modified)"
+  else
+    local saved=$((total_before - total_after))
+    local ratio_str="n/a"
+    if (( total_after > 0 )); then
+      ratio_str=$(awk -v b="$total_before" -v a="$total_after" 'BEGIN { printf "%.2fx", b/a }')
+    fi
+    log_info "  compressed:   $compressed_count files, $(format_bytes $total_before) -> $(format_bytes $total_after)"
+    log_info "  ratio:        $ratio_str  saved $(format_bytes $saved)"
+  fi
+  log_info "  skipped:      $skipped_count files"
+  local reason count
+  for reason in ${(ok)skip_counts}; do
+    count="${skip_counts[$reason]}"
+    log_info "    skip:$reason = $count"
+  done
+  local pruned_total=0 r
+  for r in too-young recent-mtime current-month; do
+    pruned_total=$((pruned_total + ${PRUNED_REASON_COUNTS[$r]:-0}))
+  done
+  if (( pruned_total > 0 )); then
+    log_info "  pruned-by-find: $pruned_total files (too-young=${PRUNED_REASON_COUNTS[too-young]:-0}, recent-mtime=${PRUNED_REASON_COUNTS[recent-mtime]:-0}, current-month=${PRUNED_REASON_COUNTS[current-month]:-0})"
+  fi
+  (( grew_count > 0 ))   && log_info "  low-savings:  $grew_count files (<2%)"
+  (( failed_count > 0 )) && log_warn "  failures:     $failed_count files"
+
+  if (( ! DRY_RUN )); then
+    local wall_s=$((EPOCHSECONDS - run_start_epoch))
+    local saved=$((total_before - total_after))
+    local run_file
+    run_file=$(ledger_write_run "$run_start_ts" "$tool" "$compressed_count" "$total_before" "$total_after" "$wall_s" "$_cas_interrupted" "$skipped_count" "$failed_count")
+    ledger_update_cumulative "$run_start_ts" "$compressed_count" "$saved"
+    log_info "ledger entry: $run_file"
+  fi
+
+  if (( _cas_interrupted )); then
+    log_warn "  (interrupted before completion)"
+    return 130
+  fi
+  return 0
+}
+
+# --- subcommand: stats -------------------------------------------------------
+
+cmd_stats() {
+  local cum="$LEDGER_DIR/cumulative.txt"
+  if [[ ! -f "$cum" ]]; then
+    log_info "no ledger yet (no compress runs recorded)"
+    log_info "ledger dir: $LEDGER_DIR"
+    return 0
+  fi
+
+  printf '=== %s: cumulative totals ===\n' "$SCRIPT_NAME"
+  local key val
+  while IFS='=' read -r key val; do
+    case "$key" in
+      first_run)              printf '  first run:        %s\n' "$val" ;;
+      last_run)               printf '  last run:         %s\n' "$val" ;;
+      total_runs)             printf '  runs:             %s\n' "$val" ;;
+      total_files_compressed) printf '  files compressed: %s\n' "$val" ;;
+      total_bytes_saved)      printf '  bytes saved:      %s (%s)\n' "$val" "$(format_bytes $val)" ;;
+    esac
+  done < "$cum"
+
+  printf '\n--- recent runs (newest first) ---\n'
+  local -a run_files
+  run_files=( ${(f)"$(ls -1 "$LEDGER_DIR/runs" 2>/dev/null | sort -r | head -10)"} )
+  if (( ${#run_files[@]} == 0 )); then
+    printf '  (none)\n'
+    return 0
+  fi
+  local run f
+  for f in "${run_files[@]}"; do
+    [[ -n "$f" ]] || continue
+    run="${f%.json}"
+    printf '  %s\n' "$run"
+  done
+  printf '\nledger dir: %s\n' "$LEDGER_DIR"
+}
+
+# --- subcommand: restore -----------------------------------------------------
+
+_restore_with_applesauce() {
+  local file="$1" _stmp _rc
+  _run_tool_capturing_stderr _stmp applesauce decompress --quiet -- "$file"
+  _rc=$?
+  if (( _rc != 0 )); then
+    if [[ -s "$_stmp" ]]; then
+      log_warn "_restore_with_applesauce failed (exit $_rc): $(< "$_stmp")"
+    elif (( _rc != _CAS_RC_MKTEMP_FAILED )); then
+      log_warn "_restore_with_applesauce failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
+    fi
+    rm -f "$_stmp"
+    return $_rc
+  fi
+  rm -f "$_stmp"
+}
+
+_restore_with_afsctool() {
+  local file="$1" _stmp _rc
+  _run_tool_capturing_stderr _stmp afsctool -d -- "$file"
+  _rc=$?
+  if (( _rc != 0 )); then
+    if [[ -s "$_stmp" ]]; then
+      log_warn "_restore_with_afsctool failed (exit $_rc): $(< "$_stmp")"
+    elif (( _rc != _CAS_RC_MKTEMP_FAILED )); then
+      log_warn "_restore_with_afsctool failed (exit $_rc)  (no stderr captured; exit=$_rc — possible signal kill)"
+    fi
+    rm -f "$_stmp"
+    return $_rc
+  fi
+  rm -f "$_stmp"
+}
+
+_restore_via_rewrite() {
+  local file="$1" tmp
+  tmp="$(dirname -- "$file")/.$(basename -- "$file").cas-rtmp"
+  cat -- "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f -- "$tmp" "$file"
+}
+
+restore_file() {
+  local file="$1" tool="$2"
+  case "$tool" in
+    applesauce) _restore_with_applesauce "$file" ;;
+    afsctool)   _restore_with_afsctool   "$file" ;;
+    ditto|*)    _restore_via_rewrite     "$file" ;;
+  esac
+}
+
+# Restore reads the on-disk decmpfs flag directly via stat (not the cache),
+# since the cache is keyed off candidate discovery which excludes already-
+# compressed files. For restore we want to operate ON already-compressed files.
+_has_decmpfs_flag_live() {
+  local flags
+  flags=$(stat -f '%Sf' -- "$1" 2>/dev/null) || return 1
+  [[ "$flags" == *compressed* ]]
+}
+
+cmd_restore() {
+  _loud_chflags_warning
+  local tool
+  tool=$(detect_tool) || return 1
+
+  local -a roots
+  roots=( ${(f)"$(resolve_roots)"} ) || return 1
+
+  log_info "scanning: ${(j:, :)roots}"
+  log_info "tool: $tool  dry-run: $( (( DRY_RUN )) && echo yes || echo no )"
+
+  # --confirm-destructive gate: count files that ACTUALLY carry the decmpfs
+  # flag (raw file count over-counts; restore filters live flags below).
+  # This pre-pass scans before any mutation OR dry-run log line, so the
+  # gate is enforced for both real and dry-run paths (Codex finding #6).
+  if (( ! CONFIRM_DESTRUCTIVE )); then
+    local _gate_root _gate_file _gate_count=0
+    for _gate_root in "${roots[@]}"; do
+      [[ -d "$_gate_root" ]] || continue
+      while IFS= read -rd '' _gate_file; do
+        [[ -n "$_gate_file" ]] || continue
+        if _has_decmpfs_flag_live "$_gate_file"; then
+          _gate_count=$((_gate_count + 1))
+          (( _gate_count > 100 )) && break
+        fi
+      done < <(find "$_gate_root" -type f -print0)
+      (( _gate_count > 100 )) && break
+    done
+    if (( _gate_count > 100 )); then
+      log_error "restore would touch >100 decmpfs-compressed files in scope"
+      log_error "  scope: ${(j:, :)roots}"
+      log_error "  decmpfs-flagged files counted (capped at 101 for early exit): $_gate_count"
+      log_error "  restore is destructive (rewrites compressed files inline). Confirm intent:"
+      log_error "    $SCRIPT_NAME restore --confirm-destructive ${(j: :)roots}"
+      log_error "  this gate also applies to --dry-run."
+      return 1
+    fi
+  fi
+
+  # Open-handle protection: mirrors cmd_compress. The _restore_via_rewrite
+  # fallback does an in-place cat-rewrite which would corrupt a live session
+  # file held open for writing. Build the open-handle set here so that every
+  # restore path (applesauce, afsctool, rewrite) is guarded uniformly.
+  build_open_handle_set || return 1
+
+  local file restored_count=0 skipped_count=0 failed_count=0 open_skipped_count=0
+  local root
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -rd '' file; do
+      [[ -n "$file" ]] || continue
+      if ! _has_decmpfs_flag_live "$file"; then
+        skipped_count=$((skipped_count + 1))
+        continue
+      fi
+
+      # Skip files held open by any process — the rewrite fallback would
+      # corrupt a file being actively written (e.g. a live .jsonl session log).
+      local canon_file="${file:A}"
+      if (( ${+OPEN_HANDLES[$canon_file]} )); then
+        log_warn "skip:open-handle (restore): $file"
+        open_skipped_count=$((open_skipped_count + 1))
+        continue
+      fi
+
+      if (( DRY_RUN )); then
+        log_info "would restore: $file"
+        restored_count=$((restored_count + 1))
+        continue
+      fi
+
+      if ! restore_file "$file" "$tool"; then
+        log_warn "restore failed: $file"
+        failed_count=$((failed_count + 1))
+        continue
+      fi
+
+      if _has_decmpfs_flag_live "$file"; then
+        log_warn "restore reported success but decmpfs flag still present: $file"
+        failed_count=$((failed_count + 1))
+        continue
+      fi
+
+      restored_count=$((restored_count + 1))
+      log_debug "restored: $file"
+    done < <(find "$root" -type f -print0)
+  done
+
+  printf '\n'
+  log_info "summary:"
+  if (( DRY_RUN )); then
+    log_info "  would restore: $restored_count files (nothing modified)"
+  else
+    log_info "  restored:      $restored_count files"
+  fi
+  log_info "  skipped:       $skipped_count files (not decmpfs-compressed)"
+  (( open_skipped_count > 0 )) && log_warn "  open-handle skips: $open_skipped_count files (held open; not restored)"
+  (( failed_count > 0 )) && log_warn "  failures:      $failed_count files"
+  return 0
+}
+
+# --- main entry ---------------------------------------------------------------
+
+main() {
+  typeset -a positional
+  positional=()
+  local subcommand="estimate"
+
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      estimate|compress|list|stats|restore) subcommand="$1"; shift ;;
+      -h|--help)    usage; return 0 ;;
+      -V|--version) version; return 0 ;;
+    esac
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)              usage; return 0 ;;
+      -V|--version)           version; return 0 ;;
+      --age-days)             shift; [[ $# -gt 0 ]] || { log_error "--age-days needs a value"; return 64; }; AGE_DAYS="$1"; shift ;;
+      --tool)                 shift; [[ $# -gt 0 ]] || { log_error "--tool needs a value"; return 64; }; TOOL="$1"; shift ;;
+      --algorithm)            shift; [[ $# -gt 0 ]] || { log_error "--algorithm needs a value"; return 64; }; ALGORITHM="$1"; shift ;;
+      --level)                shift; [[ $# -gt 0 ]] || { log_error "--level needs a value"; return 64; }; LEVEL="$1"; shift ;;
+      --include)              shift; [[ $# -gt 0 ]] || { log_error "--include needs a value"; return 64; }; INCLUDES+=("$1"); shift ;;
+      --exclude)              shift; [[ $# -gt 0 ]] || { log_error "--exclude needs a value"; return 64; }; EXCLUDES+=("$1"); shift ;;
+      --active-grace-minutes) shift; [[ $# -gt 0 ]] || { log_error "--active-grace-minutes needs a value"; return 64; }; ACTIVE_GRACE_MINUTES="$1"; shift ;;
+      --sample-fraction)      shift; [[ $# -gt 0 ]] || { log_error "--sample-fraction needs a value"; return 64; }; SAMPLE_FRACTION="$1"; shift ;;
+      --ledger-dir)           shift; [[ $# -gt 0 ]] || { log_error "--ledger-dir needs a value"; return 64; }; LEDGER_DIR="$1"; shift ;;
+      --dry-run)              DRY_RUN=1; shift ;;
+      --confirm-destructive)  CONFIRM_DESTRUCTIVE=1; shift ;;
+      --allow-system-paths)   ALLOW_SYSTEM_PATHS=1; shift ;;
+      --quiet)                QUIET=1; shift ;;
+      --verbose)              VERBOSE=1; shift ;;
+      --)                     shift; positional+=("$@"); break ;;
+      -*)                     log_error "unknown option: $1"; return 64 ;;
+      *)                      positional+=("$1"); shift ;;
+    esac
+  done
+
+  TARGET_PATHS=("${positional[@]}")
+
+  # Platform gate — runs AFTER --help/--version early-return (above) so
+  # those still work cross-platform. Runs BEFORE LEDGER_DIR initialization
+  # so non-Darwin diagnostic is reachable even if HOME is unset.
+  require_decmpfs_capable_host || return 1
+
+  # Lazy LEDGER_DIR init now that we know HOME exists and platform passed.
+  if [[ -z "$LEDGER_DIR" ]]; then
+    LEDGER_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$SCRIPT_NAME"
+  fi
+
+  # System-path denylist (only when explicit TARGET_PATHS are provided;
+  # auto-discovery is already scoped to user dirs).
+  require_no_system_paths_in_targets || return 1
+
+  case "$subcommand" in
+    estimate) cmd_estimate ;;
+    compress) cmd_compress ;;
+    list)     cmd_list ;;
+    stats)    cmd_stats ;;
+    restore)  cmd_restore ;;
+    *)        log_error "unknown subcommand: $subcommand"; usage >&2; return 64 ;;
+  esac
+}
+
+main "$@"
